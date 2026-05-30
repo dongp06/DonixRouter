@@ -5,6 +5,25 @@ import { refreshKiroToken } from "../services/tokenRefresh.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { HTTP_STATUS, DEFAULT_RETRY_CONFIG, resolveRetryEntry } from "../config/runtimeConfig.js";
 
+const TEXT_DECODER = new TextDecoder();
+const CRC32_TABLE = new Uint32Array(256);
+
+for (let i = 0; i < 256; i++) {
+  let c = i;
+  for (let j = 0; j < 8; j++) {
+    c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+  }
+  CRC32_TABLE[i] = c >>> 0;
+}
+
+function crc32(buf) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    crc = CRC32_TABLE[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
 function extractKiroErrorPayload(bodyText) {
   if (typeof bodyText !== "string") return null;
 
@@ -81,6 +100,14 @@ export function isKiroInputTooLong(bodyText) {
     || lower.includes("too many tokens");
 }
 
+function isKiroMalformedRequest(bodyText) {
+  if (typeof bodyText !== "string") return false;
+  const lower = bodyText.toLowerCase();
+  return lower.includes("improperly formed request")
+    || lower.includes("malformed request")
+    || lower.includes("invalid request");
+}
+
 function isKiroAuthTokenInvalid(status, bodyText) {
   if (status !== HTTP_STATUS.UNAUTHORIZED && status !== HTTP_STATUS.FORBIDDEN) return false;
   const lower = String(bodyText || "").toLowerCase();
@@ -113,6 +140,214 @@ function parseJsonObject(text) {
   } catch {
     return null;
   }
+}
+
+function readPositiveIntEnv(name, defaultValue) {
+  const raw = process.env?.[name];
+  if (!raw) return defaultValue;
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : defaultValue;
+}
+
+const KIRO_FETCH_HEADER_TIMEOUT_MS = readPositiveIntEnv("KIRO_FETCH_HEADER_TIMEOUT_MS", 90_000);
+const KIRO_DEBUG_EVENTS = /^(1|true|yes|on)$/i.test(process.env?.KIRO_DEBUG_EVENTS || "");
+const KIRO_EMPTY_STREAM_RETRIES = readPositiveIntEnv("KIRO_EMPTY_STREAM_RETRIES", 2);
+
+const KIRO_RETRY_CORE_TOOL_ORDER = [
+  "Read",
+  "Edit",
+  "MultiEdit",
+  "Write",
+  "Bash",
+  "PowerShell",
+  "Grep",
+  "Glob",
+  "Agent",
+];
+
+const KIRO_RETRY_CORE_TOOL_RANK = new Map(KIRO_RETRY_CORE_TOOL_ORDER.map((name, index) => [name, index]));
+
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function getKiroToolName(toolEntry) {
+  return toolEntry?.toolSpecification?.name || "";
+}
+
+function trimKiroCurrentMessageTools(transformedBody, maxTools) {
+  const context = transformedBody?.conversationState?.currentMessage?.userInputMessage?.userInputMessageContext;
+  const tools = context?.tools;
+  if (!Array.isArray(tools) || tools.length <= maxTools) return 0;
+
+  const unique = [];
+  const seen = new Set();
+  for (const tool of tools) {
+    const name = getKiroToolName(tool);
+    if (name && seen.has(name)) continue;
+    if (name) seen.add(name);
+    unique.push(tool);
+  }
+
+  unique.sort((a, b) => {
+    const aRank = KIRO_RETRY_CORE_TOOL_RANK.has(getKiroToolName(a))
+      ? KIRO_RETRY_CORE_TOOL_RANK.get(getKiroToolName(a))
+      : Number.MAX_SAFE_INTEGER;
+    const bRank = KIRO_RETRY_CORE_TOOL_RANK.has(getKiroToolName(b))
+      ? KIRO_RETRY_CORE_TOOL_RANK.get(getKiroToolName(b))
+      : Number.MAX_SAFE_INTEGER;
+    return aRank - bRank;
+  });
+
+  context.tools = unique.slice(0, maxTools);
+  return tools.length - context.tools.length;
+}
+
+function trimKiroRetryHistory(transformedBody, maxEntries) {
+  const history = transformedBody?.conversationState?.history;
+  if (!Array.isArray(history) || maxEntries <= 0 || history.length <= maxEntries) return 0;
+
+  let preserveHead = 0;
+  const firstContent = history[0]?.userInputMessage?.content || "";
+  if (firstContent.startsWith("<system-instructions>") && history[1]?.assistantResponseMessage) {
+    preserveHead = 2;
+  }
+
+  const keepTail = Math.max(2, maxEntries - preserveHead);
+  let removeCount = history.length - preserveHead - keepTail;
+  if (removeCount <= 0) return 0;
+  if (removeCount % 2 === 1) removeCount += 1;
+  removeCount = Math.min(removeCount, history.length - preserveHead);
+  history.splice(preserveHead, removeCount);
+
+  while (history.length > 0 && !history[0]?.userInputMessage) history.shift();
+  while (history.length > 0 && !history[history.length - 1]?.assistantResponseMessage) history.pop();
+
+  return removeCount;
+}
+
+function compactToolUseInputForMalformedRetry(toolUse) {
+  if (!toolUse?.input || typeof toolUse.input !== "object" || Array.isArray(toolUse.input)) return;
+  const prompt = toolUse.input.prompt;
+  if (typeof prompt === "string" && prompt.length > 480) {
+    toolUse.input = {
+      ...toolUse.input,
+      prompt: `${prompt.slice(0, 360)}\n[Kiro retry compacted ${prompt.length - 480} chars from tool prompt]\n${prompt.slice(-120)}`,
+    };
+  }
+}
+
+function compactPayloadForMalformedRetry(transformedBody, attempt) {
+  const maxHistory = attempt <= 1 ? 24 : 12;
+  const removedHistory = trimKiroRetryHistory(transformedBody, maxHistory);
+  const maxTools = attempt <= 1 ? 8 : 5;
+  const removedTools = trimKiroCurrentMessageTools(transformedBody, maxTools);
+
+  const history = transformedBody?.conversationState?.history;
+  if (Array.isArray(history)) {
+    for (const item of history) {
+      const toolUses = item?.assistantResponseMessage?.toolUses;
+      if (!Array.isArray(toolUses)) continue;
+      for (const toolUse of toolUses) compactToolUseInputForMalformedRetry(toolUse);
+    }
+  }
+
+  const current = transformedBody?.conversationState?.currentMessage?.userInputMessage;
+  if (current && typeof current.content === "string" && attempt > 1 && current.content.length > 8000) {
+    current.content = `${current.content.slice(0, 4200)}\n\n[Kiro retry compacted current message]\n\n${current.content.slice(-2800)}`;
+  }
+
+  return { removedHistory, maxHistory, removedTools, maxTools };
+}
+
+function prepareEmptyStreamRetryBody(originalBody, attempt) {
+  const retryBody = cloneJson(originalBody);
+  const maxTools = attempt <= 1 ? 8 : 5;
+  const removedTools = trimKiroCurrentMessageTools(retryBody, maxTools);
+  const maxHistory = attempt <= 1 ? 24 : 12;
+  const removedHistory = trimKiroRetryHistory(retryBody, maxHistory);
+
+  const userInput = retryBody?.conversationState?.currentMessage?.userInputMessage;
+  if (userInput && typeof userInput.content === "string") {
+    userInput.content = [
+      "<kiro-retry-instructions>",
+      "The previous upstream attempt returned an empty stream. Continue the user's request now.",
+      "If file tools are available, use them directly. Do not ask the same question again.",
+      "</kiro-retry-instructions>",
+      "",
+      userInput.content,
+    ].join("\n");
+  }
+
+  return { retryBody, removedTools, maxTools, removedHistory, maxHistory };
+}
+
+function setKiroPayloadModelId(transformedBody, modelId) {
+  const state = transformedBody?.conversationState;
+  if (!state || !modelId) return;
+
+  const visitMessage = (entry) => {
+    if (entry?.userInputMessage) entry.userInputMessage.modelId = modelId;
+  };
+
+  visitMessage(state.currentMessage);
+  if (Array.isArray(state.history)) {
+    for (const item of state.history) visitMessage(item);
+  }
+}
+
+function shouldDowngradeLargeOpusRequest(model, transformedBody) {
+  if (!String(model || "").includes("opus")) return false;
+  const state = transformedBody?.conversationState;
+  if (!state) return false;
+  const historyLen = Array.isArray(state.history) ? state.history.length : 0;
+  const currentContent = state.currentMessage?.userInputMessage?.content || "";
+  const toolCount = state.currentMessage?.userInputMessage?.userInputMessageContext?.tools?.length || 0;
+  const payloadBytes = Buffer.byteLength(JSON.stringify(transformedBody), "utf8");
+  return toolCount > 24
+    || historyLen > 80
+    || payloadBytes > 850 * 1024
+    || (typeof currentContent === "string" && (
+      currentContent.includes("<task-notification>")
+      || currentContent.includes("<local-command-stdout>")
+      || currentContent.includes("Set model to")
+    ));
+}
+
+function createTimeoutSignal(parentSignal, timeoutMs, reason) {
+  const controller = new AbortController();
+  let timedOut = false;
+  let timeoutId = null;
+
+  const cleanup = () => {
+    if (timeoutId) clearTimeout(timeoutId);
+    timeoutId = null;
+    parentSignal?.removeEventListener?.("abort", onParentAbort);
+  };
+
+  const onParentAbort = () => {
+    cleanup();
+    controller.abort(parentSignal.reason || new DOMException("Request aborted", "AbortError"));
+  };
+
+  timeoutId = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new DOMException(reason, "TimeoutError"));
+  }, timeoutMs);
+
+  if (parentSignal?.aborted) {
+    onParentAbort();
+  } else {
+    parentSignal?.addEventListener?.("abort", onParentAbort, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    cleanup,
+    get timedOut() {
+      return timedOut;
+    },
+  };
 }
 
 /**
@@ -157,7 +392,9 @@ export class KiroExecutor extends BaseExecutor {
     const headers = {
       ...this.config.headers,
       "Amz-Sdk-Request": "attempt=1; max=3",
-      "Amz-Sdk-Invocation-Id": uuidv4()
+      "Amz-Sdk-Invocation-Id": uuidv4(),
+      "x-amzn-bedrock-cache-control": "enable",
+      "anthropic-beta": "prompt-caching-2024-07-31"
     };
 
     if (credentials.accessToken) {
@@ -168,32 +405,80 @@ export class KiroExecutor extends BaseExecutor {
   }
 
   transformRequest(model, body, stream, credentials) {
-    return body;
+    if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+
+    // Kiro rejects unknown top-level fields. Preserve only the payload shape
+    // emitted by the OpenAI-to-Kiro translator.
+    const kiroPayload = {};
+    if (body.conversationState !== undefined) kiroPayload.conversationState = body.conversationState;
+    if (body.profileArn !== undefined) kiroPayload.profileArn = body.profileArn;
+    if (body.inferenceConfig !== undefined) kiroPayload.inferenceConfig = body.inferenceConfig;
+
+    if (!kiroPayload.conversationState) {
+      const { model: _model, ...rest } = body;
+      return rest;
+    }
+
+    return kiroPayload;
   }
 
   /**
    * Custom execute for Kiro - handles AWS EventStream binary response with retry support
    */
   async execute({ model, body, stream, credentials, signal, log, proxyOptions = null, onCredentialsRefreshed = null }) {
-    const url = this.buildUrl(model, stream, 0);
     let transformedBody = this.transformRequest(model, body, stream, credentials);
+    const effectiveModel = shouldDowngradeLargeOpusRequest(model, transformedBody)
+      ? "claude-sonnet-4.6"
+      : model;
+    if (effectiveModel !== model) {
+      setKiroPayloadModelId(transformedBody, effectiveModel);
+      const historyLen = transformedBody?.conversationState?.history?.length ?? 0;
+      const removedTools = trimKiroCurrentMessageTools(transformedBody, 24);
+      const removedHistory = trimKiroRetryHistory(transformedBody, 48);
+      model = effectiveModel;
+      console.warn(`[Kiro] downgraded large Opus request to ${effectiveModel}; history=${historyLen}; removedTools=${removedTools}; removedHistory=${removedHistory}; finalHistory=${transformedBody?.conversationState?.history?.length ?? 0}`);
+    }
+    const url = this.buildUrl(model, stream, 0);
 
     // Merge default retry config with provider-specific config
     const retryConfig = { ...DEFAULT_RETRY_CONFIG, ...this.config.retry };
     let retryAttempts = 0;
     let authRefreshAttempted = false;
     let inputTooLongAttempts = 0;
+    let malformedAttempts = 0;
     const MAX_INPUT_TOO_LONG_RETRIES = 3;
+    const MAX_MALFORMED_RETRIES = 2;
 
     while (true) {
       const headers = this.buildHeaders(credentials, stream);
 
-      const response = await proxyAwareFetch(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(transformedBody),
-        signal
-      }, proxyOptions);
+      const timeout = createTimeoutSignal(
+        signal,
+        KIRO_FETCH_HEADER_TIMEOUT_MS,
+        `Kiro did not return response headers within ${KIRO_FETCH_HEADER_TIMEOUT_MS}ms`
+      );
+      let response;
+      try {
+        response = await proxyAwareFetch(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(transformedBody),
+          signal: timeout.signal
+        }, proxyOptions);
+      } catch (error) {
+        if (timeout.timedOut) {
+          log?.warn?.("KIRO", `Request timed out before response headers after ${KIRO_FETCH_HEADER_TIMEOUT_MS}ms`);
+          const timeoutResponse = new Response("Kiro request timed out before response headers", {
+            status: HTTP_STATUS.GATEWAY_TIMEOUT || 504,
+            statusText: "Gateway Timeout",
+            headers: { "Content-Type": "text/plain" }
+          });
+          return { response: timeoutResponse, url, headers, transformedBody };
+        }
+        throw error;
+      } finally {
+        timeout.cleanup();
+      }
 
       // Kiro often returns 403 with a plain-text stale bearer-token message.
       // Refresh here so the generic chat handler does not have to infer it.
@@ -244,6 +529,25 @@ export class KiroExecutor extends BaseExecutor {
         }
       }
 
+      // Kiro sometimes returns only "Improperly formed request" for Claude-Code
+      // workflow transcripts that contain many Agent tool calls/results. The
+      // JSON is valid; the upstream conversation validator is choking on the
+      // tool-heavy history. Retry with a smaller, compacted transcript.
+      if (response.status === 400 && malformedAttempts < MAX_MALFORMED_RETRIES) {
+        let bodyText = "";
+        try {
+          bodyText = await response.clone().text();
+        } catch {
+          bodyText = "";
+        }
+        if (isKiroMalformedRequest(bodyText)) {
+          malformedAttempts++;
+          const stats = compactPayloadForMalformedRetry(transformedBody, malformedAttempts);
+          log?.warn?.("KIRO", `Malformed request; compacted payload and retrying ${malformedAttempts}/${MAX_MALFORMED_RETRIES} (removedHistory=${stats.removedHistory}, maxHistory=${stats.maxHistory}, removedTools=${stats.removedTools}, maxTools=${stats.maxTools})`);
+          continue;
+        }
+      }
+
       // Check if should retry based on status code
       const { attempts: maxRetries, delayMs } = resolveRetryEntry(retryConfig[response.status]);
       let shouldRetry = !response.ok && maxRetries > 0 && retryAttempts < maxRetries;
@@ -273,7 +577,53 @@ export class KiroExecutor extends BaseExecutor {
       // Success - transform and return
       // For Kiro, we need to transform the binary EventStream to SSE
       // Create a TransformStream to convert binary to SSE text
-      const transformedResponse = this.transformEventStreamToSSE(response, model);
+      const retryEmptyStream = async (attempt) => {
+        if (attempt > KIRO_EMPTY_STREAM_RETRIES) return null;
+        const { retryBody, removedTools, maxTools, removedHistory, maxHistory } = prepareEmptyStreamRetryBody(transformedBody, attempt);
+        const retryModel = String(model || "").includes("opus")
+          ? "claude-sonnet-4.6"
+          : model;
+        if (retryModel !== model) {
+          setKiroPayloadModelId(retryBody, retryModel);
+        }
+        const retryUrl = this.buildUrl(retryModel, stream, 0);
+        const retryHeaders = this.buildHeaders(credentials, stream);
+        const retryTimeout = createTimeoutSignal(
+          signal,
+          KIRO_FETCH_HEADER_TIMEOUT_MS,
+          `Kiro empty-stream retry ${attempt} did not return response headers within ${KIRO_FETCH_HEADER_TIMEOUT_MS}ms`
+        );
+
+        try {
+          console.warn(`[Kiro] empty stream retry ${attempt}/${KIRO_EMPTY_STREAM_RETRIES}; model=${retryModel}; tools removed=${removedTools}, maxTools=${maxTools}, history removed=${removedHistory}, maxHistory=${maxHistory}, history=${retryBody?.conversationState?.history?.length ?? 0}`);
+          const retryResponse = await proxyAwareFetch(retryUrl, {
+            method: "POST",
+            headers: retryHeaders,
+            body: JSON.stringify(retryBody),
+            signal: retryTimeout.signal
+          }, proxyOptions);
+
+          if (!retryResponse.ok) {
+            let bodyText = "";
+            try {
+              bodyText = await retryResponse.clone().text();
+            } catch {
+              bodyText = "";
+            }
+            console.warn(`[Kiro] empty stream retry ${attempt} returned HTTP ${retryResponse.status}: ${bodyText.slice(0, 300)}`);
+            return null;
+          }
+
+          return retryResponse;
+        } catch (error) {
+          console.warn(`[Kiro] empty stream retry ${attempt} failed: ${error?.message || error}`);
+          return null;
+        } finally {
+          retryTimeout.cleanup();
+        }
+      };
+
+      const transformedResponse = this.transformEventStreamToSSE(response, model, { retryEmptyStream });
       return { response: transformedResponse, url, headers, transformedBody };
     }
   }
@@ -308,7 +658,7 @@ export class KiroExecutor extends BaseExecutor {
    *  - catch reader errors mid-stream and still emit a clean finish + [DONE]
    *    so the client never hangs.
    */
-  transformEventStreamToSSE(response, model) {
+  transformEventStreamToSSE(response, model, options = {}) {
     const MAX_FRAME_SIZE = 32 * 1024 * 1024;
     const MAX_BUFFER_SIZE = 64 * 1024 * 1024;
     const KEEPALIVE_MS = 15000;     // SSE comment every 15s
@@ -333,8 +683,33 @@ export class KiroExecutor extends BaseExecutor {
       hasMeteringEvent: false,
       stopEventReceived: false,
       streamAborted: false,
+      upstreamStalled: false,
       doneSent: false,
       hasMeaningfulDelta: false,
+      bufferedDeltas: [],
+      debugEvents: [],
+    };
+
+    const resetStateForEmptyRetry = () => {
+      buffer = new Uint8Array(0);
+      state.finishEmitted = false;
+      state.hasToolCalls = false;
+      state.toolCallIndex = 0;
+      state.seenToolIds = new Map();
+      state.pendingToolNames = new Map();
+      state.pendingToolInputs = new Map();
+      state.skippedIncompleteToolUse = false;
+      state.totalContentLength = 0;
+      state.contextUsagePercentage = 0;
+      state.hasContextUsage = false;
+      state.hasMeteringEvent = false;
+      state.stopEventReceived = false;
+      state.streamAborted = false;
+      state.upstreamStalled = false;
+      state.hasMeaningfulDelta = false;
+      state.usage = undefined;
+      state.bufferedDeltas = [];
+      state.debugEvents = [];
     };
 
     const safeEnqueue = (controller, bytes) => {
@@ -346,6 +721,29 @@ export class KiroExecutor extends BaseExecutor {
     };
     const writePing = (controller) => {
       safeEnqueue(controller, sharedEncoder.encode(`: keepalive ${Date.now()}\n\n`));
+    };
+    const bufferDelta = (kind, content) => {
+      if (!content) return;
+      state.bufferedDeltas.push({ kind, content });
+      if (kind === "content") state.totalContentLength += content.length;
+    };
+    const flushBufferedDeltas = (controller) => {
+      if (state.bufferedDeltas.length === 0) return;
+      for (const item of state.bufferedDeltas) {
+        const delta = item.kind === "reasoning"
+          ? (chunkIndex === 0 ? { role: "assistant", reasoning_content: item.content } : { reasoning_content: item.content })
+          : (chunkIndex === 0 ? { role: "assistant", content: item.content } : { content: item.content });
+        state.hasMeaningfulDelta = true;
+        writeChunk(controller, {
+          id: responseId,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [{ index: 0, delta, finish_reason: null }]
+        });
+        chunkIndex++;
+      }
+      state.bufferedDeltas = [];
     };
 
     const computeFinishUsage = () => {
@@ -371,7 +769,9 @@ export class KiroExecutor extends BaseExecutor {
       const hasIncompleteToolUse = state.skippedIncompleteToolUse
         || state.pendingToolInputs.size > 0
         || (state.pendingToolNames.size > 0 && !state.hasToolCalls);
-      if (!force && (hasIncompleteToolUse || !state.hasMeaningfulDelta)) return;
+      const hasOutput = state.hasMeaningfulDelta || state.bufferedDeltas.length > 0;
+      if (!force && (hasIncompleteToolUse || !hasOutput)) return;
+      flushBufferedDeltas(controller);
 
       state.finishEmitted = true;
 
@@ -415,6 +815,25 @@ export class KiroExecutor extends BaseExecutor {
       chunkIndex++;
       writeChunk(controller, errChunk);
     };
+    const emitFallbackChunk = (controller, message) => {
+      const fallbackChunk = {
+        id: responseId,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: [{
+          index: 0,
+          delta: chunkIndex === 0
+            ? { role: "assistant", content: message }
+            : { content: message },
+          finish_reason: null
+        }]
+      };
+      chunkIndex++;
+      state.hasMeaningfulDelta = true;
+      state.totalContentLength += message.length;
+      writeChunk(controller, fallbackChunk);
+    };
 
     const emitDone = (controller) => {
       if (state.doneSent) return;
@@ -447,6 +866,10 @@ export class KiroExecutor extends BaseExecutor {
 
         const messageType = event.headers[":message-type"] || "event";
         const eventType = event.headers[":event-type"] || "";
+        if (KIRO_DEBUG_EVENTS || !state.hasMeaningfulDelta) {
+          state.debugEvents.push(eventType || messageType || "unknown");
+          if (state.debugEvents.length > 80) state.debugEvents.shift();
+        }
 
         if (messageType === "exception" || messageType === "error") {
           const errMsg = (event.payload && (event.payload.message || event.payload.Message))
@@ -464,39 +887,21 @@ export class KiroExecutor extends BaseExecutor {
 
         if (eventType === "assistantResponseEvent" && event.payload?.content) {
           const content = event.payload.content;
-          state.hasMeaningfulDelta = true;
-          state.totalContentLength += content.length;
-          writeChunk(controller, {
-            id: responseId,
-            object: "chat.completion.chunk",
-            created,
-            model,
-            choices: [{
-              index: 0,
-              delta: chunkIndex === 0
-                ? { role: "assistant", content }
-                : { content },
-              finish_reason: null
-            }]
-          });
-          chunkIndex++;
+          bufferDelta("content", content);
           continue;
         }
 
         if (eventType === "codeEvent" && event.payload?.content) {
-          state.hasMeaningfulDelta = true;
-          writeChunk(controller, {
-            id: responseId,
-            object: "chat.completion.chunk",
-            created,
-            model,
-            choices: [{
-              index: 0,
-              delta: { content: event.payload.content },
-              finish_reason: null
-            }]
-          });
-          chunkIndex++;
+          bufferDelta("content", event.payload.content);
+          continue;
+        }
+
+        // Reasoning/thinking deltas. Emitted as OpenAI `reasoning_content` so the
+        // downstream openai-to-claude translator turns them into Claude thinking
+        // blocks. A turn that is pure reasoning is still valid output.
+        if (eventType === "reasoningContentEvent" && event.payload?.content) {
+          const reasoning = event.payload.content;
+          bufferDelta("reasoning", reasoning);
           continue;
         }
 
@@ -548,6 +953,7 @@ export class KiroExecutor extends BaseExecutor {
             if (isNewTool) state.seenToolIds.set(toolCallId, toolIndex);
             state.pendingToolNames.delete(toolCallId);
 
+            flushBufferedDeltas(controller);
             state.hasToolCalls = true;
             state.hasMeaningfulDelta = true;
             writeChunk(controller, {
@@ -627,10 +1033,32 @@ export class KiroExecutor extends BaseExecutor {
     };
 
     if (!response.body) {
-      return new Response("data: [DONE]\n\n", {
+      const emptyBodyError = {
+        id: responseId,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: [{
+          index: 0,
+          delta: { role: "assistant", content: "[Kiro Error] upstream returned no response body" },
+          finish_reason: null
+        }]
+      };
+      const emptyBodyFinish = {
+        id: responseId,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        usage: { prompt_tokens: 0, completion_tokens: 1, total_tokens: 1 }
+      };
+      return new Response(
+        `data: ${JSON.stringify(emptyBodyError)}\n\ndata: ${JSON.stringify(emptyBodyFinish)}\n\ndata: [DONE]\n\n`,
+        {
         status: response.status,
         headers: { "Content-Type": "text/event-stream" }
-      });
+        }
+      );
     }
 
     const out = new ReadableStream({
@@ -645,7 +1073,8 @@ export class KiroExecutor extends BaseExecutor {
         });
         chunkIndex++;
 
-        const reader = response.body.getReader();
+        let reader = response.body.getReader();
+        let emptyRetryAttempts = 0;
         let lastDataAt = Date.now();
         let closed = false;
 
@@ -659,6 +1088,19 @@ export class KiroExecutor extends BaseExecutor {
         const stallTimer = setInterval(() => {
           if (closed) return;
           if (Date.now() - lastDataAt < STALL_MS) return;
+          if (
+            !state.hasMeaningfulDelta
+            && state.bufferedDeltas.length === 0
+            && !state.upstreamStalled
+            && typeof options.retryEmptyStream === "function"
+            && emptyRetryAttempts < KIRO_EMPTY_STREAM_RETRIES
+          ) {
+            console.warn(`[Kiro] upstream silent for ${STALL_MS}ms before first delta; retrying internally`);
+            state.upstreamStalled = true;
+            try { reader.cancel("stall-before-delta"); } catch { /* ignore */ }
+            return;
+          }
+          if (state.upstreamStalled) return;
           console.warn(`[Kiro] upstream silent for ${STALL_MS}ms — closing gracefully`);
           state.streamAborted = true;
           emitErrorChunk(controller, "upstream stalled");
@@ -677,11 +1119,25 @@ export class KiroExecutor extends BaseExecutor {
             || state.pendingToolInputs.size > 0
             || (state.pendingToolNames.size > 0 && !state.hasToolCalls);
           if (!state.finishEmitted && !state.streamAborted && hasIncompleteToolUse) {
-            emitErrorChunk(controller, "upstream ended before complete tool parameters");
+            const pending = state.pendingToolInputs.size || state.pendingToolNames.size;
+            console.warn(`[Kiro] upstream ended before complete tool parameters; events=${state.debugEvents.join(",") || "none"}; pending=${pending}`);
+            if (!state.hasMeaningfulDelta) {
+              emitErrorChunk(controller, "upstream ended before complete tool parameters");
+            } else {
+              console.warn("[Kiro] suppressing incomplete trailing tool_use because valid assistant output was already streamed");
+            }
             state.stopEventReceived = true;
-          } else if (!state.finishEmitted && !state.streamAborted && !state.hasMeaningfulDelta) {
-            emitErrorChunk(controller, "upstream ended without content");
+          } else if (
+            !state.finishEmitted
+            && !state.streamAborted
+            && !state.hasMeaningfulDelta
+            && state.bufferedDeltas.length === 0
+          ) {
+            console.warn(`[Kiro] upstream returned empty response; events=${state.debugEvents.join(",") || "none"}`);
+            emitFallbackChunk(controller, "Kiro upstream did not return usable content after retry. Continue with a shorter direct instruction, or reduce background-agent/workflow history.");
             state.stopEventReceived = true;
+          } else if (KIRO_DEBUG_EVENTS) {
+            console.log(`[Kiro] event sequence: ${state.debugEvents.join(",") || "none"}`);
           }
           if (!state.finishEmitted) emitFinish(controller, { force: true });
           emitDone(controller);
@@ -690,6 +1146,7 @@ export class KiroExecutor extends BaseExecutor {
 
         try {
           while (true) {
+            while (true) {
             const { done, value } = await reader.read();
             if (done) break;
             if (state.streamAborted) break;
@@ -712,6 +1169,33 @@ export class KiroExecutor extends BaseExecutor {
             }
 
             drainFrames(controller);
+          }
+
+            const hasIncompleteBeforeRetry = state.skippedIncompleteToolUse
+              || state.pendingToolInputs.size > 0
+              || (state.pendingToolNames.size > 0 && !state.hasToolCalls);
+            const canRetryEmpty = !state.streamAborted
+              && !state.finishEmitted
+              && !state.hasMeaningfulDelta
+              && (state.bufferedDeltas.length === 0 || hasIncompleteBeforeRetry)
+              && typeof options.retryEmptyStream === "function"
+              && emptyRetryAttempts < KIRO_EMPTY_STREAM_RETRIES;
+
+            if (!canRetryEmpty) break;
+
+            emptyRetryAttempts++;
+            const retryReason = state.upstreamStalled ? "stalled before first delta" : "empty response";
+            console.warn(`[Kiro] upstream ${retryReason}; retrying internally (${emptyRetryAttempts}/${KIRO_EMPTY_STREAM_RETRIES}); events=${state.debugEvents.join(",") || "none"}`);
+            writePing(controller);
+            const retryResponse = await options.retryEmptyStream(emptyRetryAttempts);
+            if (!retryResponse?.body) {
+              if (emptyRetryAttempts < KIRO_EMPTY_STREAM_RETRIES) continue;
+              break;
+            }
+
+            resetStateForEmptyRetry();
+            reader = retryResponse.body.getReader();
+            lastDataAt = Date.now();
           }
         } catch (err) {
           // Upstream socket reset / fetch body error — most common cause of
@@ -764,6 +1248,22 @@ export class KiroExecutor extends BaseExecutor {
         proxyOptions
       );
 
+      if (!result || result.error) return result;
+
+      if (result._newClientId) {
+        return {
+          accessToken: result.accessToken,
+          refreshToken: result.refreshToken,
+          expiresIn: result.expiresIn,
+          providerSpecificData: {
+            ...(credentials.providerSpecificData || {}),
+            clientId: result._newClientId,
+            clientSecret: result._newClientSecret,
+            clientSecretExpiresAt: result._newClientSecretExpiresAt,
+          },
+        };
+      }
+
       return result;
     } catch (error) {
       log?.error?.("TOKEN", `Kiro refresh error: ${error.message}`);
@@ -777,8 +1277,28 @@ export class KiroExecutor extends BaseExecutor {
  */
 function parseEventFrame(data) {
   try {
-    const view = new DataView(data.buffer, data.byteOffset);
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const totalLength = view.getUint32(0, false);
     const headersLength = view.getUint32(4, false);
+    const preludeCRC = view.getUint32(8, false);
+    const computedPreludeCRC = crc32(data.slice(0, 8));
+
+    if (totalLength !== data.length || totalLength < 16) {
+      console.warn(`[Kiro] Invalid frame length: declared ${totalLength}, actual ${data.length}`);
+      return null;
+    }
+
+    if (preludeCRC !== computedPreludeCRC) {
+      console.warn(`[Kiro] Prelude CRC mismatch: expected ${preludeCRC}, got ${computedPreludeCRC}`);
+      return null;
+    }
+
+    const messageCRC = view.getUint32(data.length - 4, false);
+    const computedMessageCRC = crc32(data.slice(0, data.length - 4));
+    if (messageCRC !== computedMessageCRC) {
+      console.warn(`[Kiro] Message CRC mismatch: expected ${messageCRC}, got ${computedMessageCRC}`);
+      return null;
+    }
 
     // Parse headers
     const headers = {};
@@ -790,7 +1310,7 @@ function parseEventFrame(data) {
       offset++;
       if (offset + nameLen > data.length) break;
 
-      const name = new TextDecoder().decode(data.slice(offset, offset + nameLen));
+      const name = TEXT_DECODER.decode(data.slice(offset, offset + nameLen));
       offset += nameLen;
 
       const headerType = data[offset];
@@ -820,7 +1340,7 @@ function parseEventFrame(data) {
         if (offset + valueLen > data.length) break;
 
         if (headerType === 7) {
-          headers[name] = new TextDecoder().decode(data.slice(offset, offset + valueLen));
+          headers[name] = TEXT_DECODER.decode(data.slice(offset, offset + valueLen));
         }
         offset += valueLen;
       } else if (headerType === 9) {
@@ -837,7 +1357,7 @@ function parseEventFrame(data) {
 
     let payload = null;
     if (payloadEnd > payloadStart) {
-      const payloadStr = new TextDecoder().decode(data.slice(payloadStart, payloadEnd));
+      const payloadStr = TEXT_DECODER.decode(data.slice(payloadStart, payloadEnd));
 
       // Skip empty or whitespace-only payloads
       if (!payloadStr || !payloadStr.trim()) {

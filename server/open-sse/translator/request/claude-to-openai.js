@@ -191,7 +191,8 @@ function convertClaudeMessage(msg) {
           toolResults.push({
             role: "tool",
             tool_call_id: block.tool_use_id,
-            content: resultContent
+            content: resultContent,
+            is_error: block.is_error === true || resultContent.includes("<tool_use_error>")
           });
           break;
       }
@@ -252,4 +253,3 @@ function convertToolChoice(choice) {
 
 // Register
 register(FORMATS.CLAUDE, FORMATS.OPENAI, claudeToOpenAIRequest, null);
-

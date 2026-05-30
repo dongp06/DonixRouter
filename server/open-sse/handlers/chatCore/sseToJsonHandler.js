@@ -95,6 +95,60 @@ export function parseSSEToOpenAIResponse(rawSSE, fallbackModel) {
   return result;
 }
 
+function tryParseJSON(value) {
+  if (!value || typeof value !== "string") return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function openAIChatCompletionToSourceResponse(openaiResponse, sourceFormat, fallbackModel) {
+  if (sourceFormat !== FORMATS.CLAUDE) return openaiResponse;
+
+  const choice = openaiResponse?.choices?.[0] || {};
+  const message = choice.message || {};
+  const content = [];
+
+  if (typeof message.content === "string" && message.content.length > 0) {
+    content.push({ type: "text", text: message.content });
+  }
+
+  if (Array.isArray(message.tool_calls)) {
+    for (const tc of message.tool_calls) {
+      const name = tc?.function?.name || "";
+      if (!tc?.id || !name) continue;
+      content.push({
+        type: "tool_use",
+        id: tc.id,
+        name,
+        input: tryParseJSON(tc.function?.arguments || "{}")
+      });
+    }
+  }
+
+  if (content.length === 0) content.push({ type: "text", text: "" });
+
+  const usage = openaiResponse?.usage || {};
+  const stopReason = choice.finish_reason === "tool_calls" ? "tool_use" : "end_turn";
+
+  return {
+    id: openaiResponse?.id || `msg_${Date.now()}`,
+    type: "message",
+    role: "assistant",
+    model: openaiResponse?.model || fallbackModel || "unknown",
+    content,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: {
+      input_tokens: usage.prompt_tokens || 0,
+      output_tokens: usage.completion_tokens || 0
+    }
+  };
+}
+
 /**
  * Handle case: provider forced streaming but client wants JSON.
  * Supports both Codex/Responses API SSE and standard Chat Completions SSE.
@@ -283,7 +337,8 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, pr
       }
     }
 
-    return { success: true, response: new Response(JSON.stringify(parsed), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
+    const finalResponse = openAIChatCompletionToSourceResponse(parsed, sourceFormat, model);
+    return { success: true, response: new Response(JSON.stringify(finalResponse), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
   } catch (err) {
     console.error("[ChatCore] Chat Completions SSE→JSON failed:", err);
     return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Failed to convert streaming response to JSON");

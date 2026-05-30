@@ -4,6 +4,7 @@ import { trackPendingRequest, appendRequestLog } from "#lib/usageDb.js";
 import { extractUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, COLORS } from "./usageTracking.js";
 import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE } from "./streamHelpers.js";
 import { recordStreamCloseEvent } from "../../logs/stream-close-event.js";
+import path from "node:path";
 
 export { COLORS, formatSSE };
 
@@ -43,6 +44,55 @@ export function collectResponsesMetadata(payload, currentResponseId = null, func
   }
 
   return { responseId: nextResponseId, functionCallIds };
+}
+
+function textFromContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => typeof part?.text === "string" ? part.text : "")
+    .filter(Boolean)
+    .join("\n");
+}
+
+function extractWorkspaceDir(body) {
+  const haystack = [];
+
+  if (Array.isArray(body?.messages)) {
+    const head = body.messages.slice(0, 8);
+    const tail = body.messages.slice(-50);
+    for (const msg of [...head, ...tail]) {
+      haystack.push(textFromContent(msg.content));
+    }
+  }
+
+  const text = haystack.join("\n");
+  const cwdPatterns = [
+    /<cwd>([^<]+)<\/cwd>/i,
+    /(?:current working directory|working directory|cwd)\s*[:=]\s*([A-Za-z]:[^\r\n<]+)/i,
+    /Contents of ([A-Za-z]:[^\r\n]+?)[\\/]CLAUDE\.md/i,
+  ];
+
+  for (const pattern of cwdPatterns) {
+    const match = text.match(pattern);
+    if (!match?.[1]) continue;
+    return match[1].trim().replace(/[\\/]+CLAUDE\.md$/i, "");
+  }
+
+  const pathMatches = [...text.matchAll(/[A-Za-z]:[^\r\n"'`<>|]+/g)]
+    .map(match => match[0].trim().replace(/[).,\]]+$/g, ""))
+    .filter(value => /[\\/]/.test(value));
+
+  for (const candidate of pathMatches) {
+    const normalized = candidate.replace(/\//g, "\\");
+    const srcMatch = normalized.match(/^(.+?)[\\/]src[\\/]/i);
+    if (srcMatch?.[1]) return srcMatch[1];
+    const pluginMatch = normalized.match(/^(.+?)[\\/](?:plugins|commands|utils|config|tests)[\\/]/i);
+    if (pluginMatch?.[1]) return pluginMatch[1];
+    if (/[\\/]package\.json$/i.test(normalized)) return path.dirname(normalized);
+  }
+
+  return null;
 }
 
 /**
@@ -92,7 +142,7 @@ export function createSSEStream(options = {}) {
   const decoder = new TextDecoder("utf-8", { fatal: false });
 
   const state = mode === STREAM_MODE.TRANSLATE
-    ? { ...initState(sourceFormat), provider, toolNameMap, model, requestTools: body?.tools }
+    ? { ...initState(sourceFormat), provider, toolNameMap, model, requestTools: body?.tools, workspaceDir: extractWorkspaceDir(body) }
     : null;
 
   let totalContentLength = 0;

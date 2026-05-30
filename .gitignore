@@ -94,3 +94,4 @@ ruvector.db
 # scratch / archive
 *.zip
 nul
+/OmniRoute-main

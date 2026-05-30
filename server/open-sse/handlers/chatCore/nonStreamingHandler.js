@@ -4,7 +4,7 @@ import { ollamaBodyToOpenAI } from "../../translator/response/ollama-to-openai.j
 import { addBufferToUsage, filterUsageForFormat } from "../../utils/usageTracking.js";
 import { createErrorResult } from "../../utils/error.js";
 import { HTTP_STATUS } from "../../config/runtimeConfig.js";
-import { parseSSEToOpenAIResponse } from "./sseToJsonHandler.js";
+import { openAIChatCompletionToSourceResponse, parseSSEToOpenAIResponse } from "./sseToJsonHandler.js";
 import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, saveUsageStats } from "./requestDetail.js";
 import { appendRequestLog, saveRequestDetail } from "#lib/usageDb.js";
 import { decloakToolNames } from "../../utils/claudeCloaking.js";
@@ -132,6 +132,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   trackDone();
   const contentType = providerResponse.headers.get("content-type") || "";
   let responseBody;
+  let responseBodyIsOpenAIFromSSE = false;
 
   if (contentType.includes("text/event-stream")) {
     const sseText = await providerResponse.text();
@@ -141,6 +142,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
       return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Invalid SSE response for non-streaming request");
     }
     responseBody = parsed;
+    responseBodyIsOpenAIFromSSE = true;
   } else {
     try {
       responseBody = await providerResponse.json();
@@ -160,16 +162,24 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   appendLog({ tokens: usage, status: "200 OK" });
   saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint });
 
-  const translatedResponse = needsTranslation(targetFormat, sourceFormat)
-    ? translateNonStreamingResponse(responseBody, targetFormat, sourceFormat)
-    : responseBody;
+  const translatedResponse = responseBodyIsOpenAIFromSSE
+    ? openAIChatCompletionToSourceResponse(responseBody, sourceFormat, model)
+    : needsTranslation(targetFormat, sourceFormat)
+      ? translateNonStreamingResponse(responseBody, targetFormat, sourceFormat)
+      : responseBody;
 
   const responseId = translatedResponse?.id || responseBody?.id || null;
-  const functionCallIds = Array.isArray(translatedResponse?.choices?.[0]?.message?.tool_calls)
+  let functionCallIds = Array.isArray(translatedResponse?.choices?.[0]?.message?.tool_calls)
     ? translatedResponse.choices[0].message.tool_calls
       .map(tc => tc?.id)
       .filter(id => typeof id === "string" && id)
     : undefined;
+  if (!functionCallIds && sourceFormat === FORMATS.CLAUDE && Array.isArray(translatedResponse?.content)) {
+    functionCallIds = translatedResponse.content
+      .filter(block => block?.type === "tool_use" && typeof block.id === "string" && block.id)
+      .map(block => block.id);
+    if (functionCallIds.length === 0) functionCallIds = undefined;
+  }
   if (onRequestSuccess) {
     await onRequestSuccess({
       responseId,
@@ -188,25 +198,31 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
     }
   }
 
-  // Ensure OpenAI-required fields
-  if (!translatedResponse.object) translatedResponse.object = "chat.completion";
-  if (!translatedResponse.created) translatedResponse.created = Math.floor(Date.now() / 1000);
+  if (sourceFormat === FORMATS.CLAUDE) {
+    if (translatedResponse?.usage) {
+      translatedResponse.usage = filterUsageForFormat(translatedResponse.usage, sourceFormat);
+    }
+  } else {
+    // Ensure OpenAI-required fields
+    if (!translatedResponse.object) translatedResponse.object = "chat.completion";
+    if (!translatedResponse.created) translatedResponse.created = Math.floor(Date.now() / 1000);
 
-  // Strip Azure-specific fields
-  delete translatedResponse.prompt_filter_results;
-  if (translatedResponse?.choices) {
-    for (const choice of translatedResponse.choices) delete choice.content_filter_results;
-  }
+    // Strip Azure-specific fields
+    delete translatedResponse.prompt_filter_results;
+    if (translatedResponse?.choices) {
+      for (const choice of translatedResponse.choices) delete choice.content_filter_results;
+    }
 
-  if (translatedResponse?.usage) {
-    translatedResponse.usage = filterUsageForFormat(addBufferToUsage(translatedResponse.usage), sourceFormat);
-  }
+    if (translatedResponse?.usage) {
+      translatedResponse.usage = filterUsageForFormat(addBufferToUsage(translatedResponse.usage), sourceFormat);
+    }
 
-  // Strip reasoning_content — some clients (e.g. Firecrawl AI SDK) have JSON parsers that
-  // break on this non-standard field, even though OpenAI allows it in extensions.
-  if (translatedResponse?.choices) {
-    for (const choice of translatedResponse.choices) {
-      if (choice?.message) delete choice.message.reasoning_content;
+    // Strip reasoning_content — some clients (e.g. Firecrawl AI SDK) have JSON parsers that
+    // break on this non-standard field, even though OpenAI allows it in extensions.
+    if (translatedResponse?.choices) {
+      for (const choice of translatedResponse.choices) {
+        if (choice?.message) delete choice.message.reasoning_content;
+      }
     }
   }
 

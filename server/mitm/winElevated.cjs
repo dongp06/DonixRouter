@@ -66,10 +66,11 @@ function runElevatedPowerShell(script) {
     ) -Verb RunAs -Wait -PassThru -WindowStyle Hidden;
     if ($proc.ExitCode -ne 0) { throw "Elevated command exited with code $($proc.ExitCode)" }
   `;
+  const wrapperEncoded = Buffer.from(wrapper, "utf16le").toString("base64");
 
   return new Promise((resolve, reject) => {
     exec(
-      `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ${quotePs(wrapper)}`,
+      `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${wrapperEncoded}`,
       { windowsHide: true },
       (error, stdout, stderr) => {
         if (error) {
