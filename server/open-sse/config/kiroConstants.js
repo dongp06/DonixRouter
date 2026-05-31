@@ -8,6 +8,7 @@ export const KIRO_THINKING_BUDGET_DEFAULT = 16000;
 
 export const KIRO_AGENTIC_SYSTEM_PROMPT = `
 # CRITICAL: CHUNKED WRITE PROTOCOL (MANDATORY)
+
 You MUST follow these rules for ALL file operations. Violation causes server timeouts and task failure.
 
 ## ABSOLUTE LIMITS
@@ -31,6 +32,29 @@ You MUST follow these rules for ALL file operations. Violation causes server tim
 1. Generate in logical sections (imports, types, functions separately)
 2. Write each section as a separate operation
 3. Use append operations for subsequent sections
+
+## EXAMPLES OF CORRECT BEHAVIOR
+
+CORRECT: Writing a 600-line file
+- Operation 1: Write lines 1-300 (initial file creation)
+- Operation 2: Append lines 301-600
+
+CORRECT: Editing multiple functions
+- Operation 1: Edit function A
+- Operation 2: Edit function B
+- Operation 3: Edit function C
+
+WRONG: Writing 500 lines in single operation -> TIMEOUT
+WRONG: Rewriting entire file to change 5 lines -> TIMEOUT
+WRONG: Generating massive code blocks without chunking -> TIMEOUT
+
+## WHY THIS MATTERS
+- Server has 2-3 minute timeout for operations
+- Large writes exceed timeout and FAIL completely
+- Chunked writes are FASTER and more RELIABLE
+- Failed writes waste time and require retry
+
+REMEMBER: When in doubt, write LESS per operation. Multiple small operations > one large operation.
 `.trim();
 
 export function isAgenticModel(model) {
@@ -68,7 +92,7 @@ export function resolveKiroModel(model) {
 
 export function buildThinkingSystemPrefix(budget = KIRO_THINKING_BUDGET_DEFAULT) {
   const safeBudget = Math.max(1, Math.min(32000, Number(budget) || KIRO_THINKING_BUDGET_DEFAULT));
-  return `enabled\n${safeBudget}`;
+  return `<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>${safeBudget}</max_thinking_length>`;
 }
 
 export function isThinkingEnabled(body, headers, model) {
@@ -129,6 +153,7 @@ function containsThinkingModeTag(body) {
 
 function containsTagInText(text) {
   if (!text) return false;
-  if (!text.includes("")) return false;
-  return text.includes("enabled") || text.includes("interleaved");
+  if (!text.includes("<thinking_mode>")) return false;
+  return text.includes("<thinking_mode>enabled</thinking_mode>")
+    || text.includes("<thinking_mode>interleaved</thinking_mode>");
 }

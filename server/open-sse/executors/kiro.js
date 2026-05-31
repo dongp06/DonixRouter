@@ -156,6 +156,11 @@ export class KiroExecutor extends BaseExecutor {
 
           const eventType = event.headers[":event-type"] || "";
 
+          // Debug: log all event types from Kiro
+          if (eventType && eventType !== "assistantResponseEvent") {
+            console.log(`[Kiro DEBUG] eventType=${eventType} | payload keys=${event.payload ? Object.keys(event.payload).join(",") : "null"}`);
+          }
+
           if (!state.totalContentLength) state.totalContentLength = 0;
           if (!state.contextUsagePercentage) state.contextUsagePercentage = 0;
 

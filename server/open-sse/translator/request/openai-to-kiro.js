@@ -230,8 +230,10 @@ export function buildKiroPayload(model, body, stream, credentials) {
   const temperature = body.temperature;
   const topP = body.top_p;
 
+  console.log(`[Kiro DEBUG] buildKiroPayload model="${model}"`);
   const { upstream: upstreamModel, agentic, thinking: modelImpliesThinking } = resolveKiroModel(model);
   const thinkingEnabled = modelImpliesThinking || isThinkingEnabled(body, null, model);
+  console.log(`[Kiro DEBUG] upstream="${upstreamModel}" agentic=${agentic} thinking=${modelImpliesThinking} thinkingEnabled=${thinkingEnabled}`);
 
   const { history, currentMessage } = convertMessages(messages, tools, upstreamModel);
 

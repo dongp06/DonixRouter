@@ -139,6 +139,7 @@ export const PROVIDER_MODELS = {
     { id: "text-embedding-3-large", name: "Text Embedding 3 Large (GitHub)", type: "embedding" },
   ],
   kr: [  // Kiro AI
+    // --- Base models ---
     { id: "claude-opus-4.7", name: "Claude Opus 4.7" },
     { id: "claude-opus-4.6", name: "Claude Opus 4.6" },
     { id: "claude-sonnet-4.6", name: "Claude Sonnet 4.6" },
@@ -151,6 +152,24 @@ export const PROVIDER_MODELS = {
     { id: "glm-5", name: "GLM 5" },
     { id: "minimax-m2.5", name: "MiniMax M2.5" },
     { id: "minimax-m2.1", name: "MiniMax M2.1" },
+    // --- Thinking variants (same upstream model; thinking enabled via system-prompt injection) ---
+    { id: "claude-opus-4.7-thinking", name: "Claude Opus 4.7 (Thinking)" },
+    { id: "claude-opus-4.6-thinking", name: "Claude Opus 4.6 (Thinking)" },
+    { id: "claude-sonnet-4.6-thinking", name: "Claude Sonnet 4.6 (Thinking)" },
+    { id: "claude-sonnet-4.5-thinking", name: "Claude Sonnet 4.5 (Thinking)" },
+    { id: "claude-haiku-4.5-thinking", name: "Claude Haiku 4.5 (Thinking)" },
+    // --- Agentic variants (chunked-write system prompt to avoid Kiro server timeout) ---
+    { id: "claude-opus-4.7-agentic", name: "Claude Opus 4.7 (Agentic)" },
+    { id: "claude-opus-4.6-agentic", name: "Claude Opus 4.6 (Agentic)" },
+    { id: "claude-sonnet-4.6-agentic", name: "Claude Sonnet 4.6 (Agentic)" },
+    { id: "claude-sonnet-4.5-agentic", name: "Claude Sonnet 4.5 (Agentic)" },
+    { id: "claude-haiku-4.5-agentic", name: "Claude Haiku 4.5 (Agentic)" },
+    // --- Thinking + Agentic ---
+    { id: "claude-opus-4.7-thinking-agentic", name: "Claude Opus 4.7 (Thinking + Agentic)" },
+    { id: "claude-opus-4.6-thinking-agentic", name: "Claude Opus 4.6 (Thinking + Agentic)" },
+    { id: "claude-sonnet-4.6-thinking-agentic", name: "Claude Sonnet 4.6 (Thinking + Agentic)" },
+    { id: "claude-sonnet-4.5-thinking-agentic", name: "Claude Sonnet 4.5 (Thinking + Agentic)" },
+    { id: "claude-haiku-4.5-thinking-agentic", name: "Claude Haiku 4.5 (Thinking + Agentic)" },
   ],
   cu: [  // Cursor IDE
     { id: "default", name: "Auto (Server Picks)" },
