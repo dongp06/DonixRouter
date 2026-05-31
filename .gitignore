@@ -95,3 +95,6 @@ ruvector.db
 *.zip
 nul
 /OmniRoute-main
+/capture-kit
+/scripts
+/server/logs

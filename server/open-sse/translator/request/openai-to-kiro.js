@@ -849,6 +849,24 @@ function convertMessages(messages, tools, model) {
     currentMessage.userInputMessage.userInputMessageContext.tools = firstHistoryTools;
   }
 
+  // Kiro rejects toolResults in currentMessage (400 Improperly formed request).
+  // Move them into a history user/assistant pair before currentMessage.
+  const cmCtx = currentMessage?.userInputMessage?.userInputMessageContext;
+  if (cmCtx?.toolResults && cmCtx.toolResults.length > 0) {
+    const toolResultsUser = {
+      userInputMessage: {
+        content: "",
+        modelId: currentMessage.userInputMessage.modelId || "",
+        userInputMessageContext: { toolResults: cmCtx.toolResults }
+      }
+    };
+    const bridgeAssistant = {
+      assistantResponseMessage: { content: "Continuing based on tool results." }
+    };
+    mergedHistory.push(toolResultsUser, bridgeAssistant);
+    delete cmCtx.toolResults;
+  }
+
   return { history: mergedHistory, currentMessage };
 }
 

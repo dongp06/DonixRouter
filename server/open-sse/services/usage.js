@@ -842,20 +842,24 @@ async function getKiroUsage(accessToken, providerSpecificData, proxyOptions = nu
     },
     {
       name: "codewhisperer-post",
-      run: async () => proxyAwareFetch("https://codewhisperer.us-east-1.amazonaws.com", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${accessToken}`,
-          "Content-Type": "application/x-amz-json-1.0",
-          "x-amz-target": "AmazonCodeWhispererService.GetUsageLimits",
-          "Accept": "application/json",
-        },
-        body: JSON.stringify({
-          origin: "AI_EDITOR",
-          profileArn,
-          resourceType: "AGENTIC_REQUEST",
-        }),
-      }, proxyOptions),
+      run: async () => proxyAwareFetch(
+        `https://codewhisperer.us-east-1.amazonaws.com/?profileArn=${encodeURIComponent(profileArn)}&origin=KIRO_CLI&isEmailRequired=true`,
+        {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${accessToken}`,
+            "Content-Type": "application/x-amz-json-1.0",
+            "x-amz-target": "AmazonCodeWhispererService.GetUsageLimits",
+            "Accept": "application/json",
+            "User-Agent": "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0",
+            "X-Amz-User-Agent": "aws-sdk-js/3.0.0 kiro-ide/1.0.0",
+          },
+          body: JSON.stringify({
+            profileArn,
+            origin: "KIRO_CLI",
+            isEmailRequired: true,
+          }),
+        }, proxyOptions),
     },
     {
       name: "q-get",
