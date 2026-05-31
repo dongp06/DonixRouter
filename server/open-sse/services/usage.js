@@ -4,7 +4,6 @@
 
 import { CLIENT_METADATA, getPlatformUserAgent } from "../config/appConstants.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
-import { KiroService } from "#lib/oauth/services/kiro.js";
 
 // GitHub API config
 const GITHUB_CONFIG = {
@@ -772,49 +771,13 @@ function parseKiroQuotaData(data) {
   };
 }
 
-function resolveKiroIdp(providerSpecificData = {}) {
-  const raw = providerSpecificData.idp || providerSpecificData.provider || providerSpecificData.authMethod || "Google";
-  return String(raw).toLowerCase().includes("github") ? "Github" : "Google";
-}
 
-function resolveKiroCookieHeader(accessToken, providerSpecificData = {}) {
-  const raw = providerSpecificData.cookieHeader || providerSpecificData.webCookie || providerSpecificData.fullCookie;
-  if (typeof raw === "string" && raw.includes("=")) return raw;
-  return `AccessToken=${accessToken}; Idp=${resolveKiroIdp(providerSpecificData)}`;
-}
-
-async function getKiroPortalUsage(accessToken, providerSpecificData, proxyOptions = null) {
-  const profileArn = providerSpecificData?.profileArn;
-  if (!profileArn) return null;
-
-  const service = new KiroService();
-  const idp = resolveKiroIdp(providerSpecificData);
-  const cookieHeader = resolveKiroCookieHeader(accessToken, providerSpecificData);
-  const fetchFn = (url, init) => proxyAwareFetch(url, init, proxyOptions);
-  const csrf = providerSpecificData?.csrfToken || (await service.fetchCsrf(accessToken, idp, { fetchFn, cookieHeader })).csrf;
-  const { data } = await service.getUserUsageAndLimitsCbor(
-    accessToken,
-    idp,
-    csrf,
-    { profileArn },
-    { fetchFn, cookieHeader }
-  );
-
-  return parseKiroQuotaData(data);
-}
 
 async function getKiroUsage(accessToken, providerSpecificData, proxyOptions = null) {
   // Default profileArn fallback
   const DEFAULT_PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
   const profileArn = providerSpecificData?.profileArn || DEFAULT_PROFILE_ARN;
   const authMethod = providerSpecificData?.authMethod || "builder-id";
-
-  try {
-    const portalUsage = await getKiroPortalUsage(accessToken, providerSpecificData, proxyOptions);
-    if (portalUsage) return portalUsage;
-  } catch (error) {
-    console.warn(`[Kiro Usage] Portal usage unavailable, falling back: ${error.message}`);
-  }
 
   const getUsageParams = new URLSearchParams({
     isEmailRequired: "true",
